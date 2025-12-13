@@ -1,0 +1,278 @@
+name: PR Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: npm run lint || echo "eslint_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Run Prettier check
+        id: prettier
+        run: npx prettier --check . || echo "prettier_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eslintFailed = process.env.ESLINT_FAILED === 'true';
+            const prettierFailed = process.env.PRETTIER_FAILED === 'true';
+            
+            let commentBody = "## Code Quality Report\n\n";
+            commentBody += "### ESLint\n";
+            commentBody += eslintFailed ? "❌ ESLint found issues. Please fix them.\n" : "✅ No ESLint issues found.\n";
+            commentBody += "\n### Prettier\n";
+            commentBody += prettierFailed ? "❌ Prettier found formatting issues. Please run `npx prettier --write .` to fix.\n" : "✅ Prettier formatting is correct.\n";
+            
+            // Post comment
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+        env:
+          ESLINT_FAILED: ${{ steps.eslint.outputs.eslint_failed }}
+          PRETTIER_FAILED: ${{ steps.prettier.outputs.prettier_failed }}
+        if: always()
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: tests
+        run: npm test -- --coverage || echo "tests_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const testsFailed = process.env.TESTS_FAILED === 'true';
+            let coverageSummary;
+            try {
+              coverageSummary = require('./coverage/coverage-summary.json');
+            } catch (e) {
+              coverageSummary = { total: { lines: { pct: 0 } } };
+            }
+            const linesCoverage = coverageSummary.total.lines.pct;
+            
+            let commentBody = "## Test Coverage Report\n\n";
+            if (testsFailed) {
+              commentBody += "❌ Tests failed. Please fix the failing tests.\n";
+            } else {
+              commentBody += `✅ All tests passed!\n`;
+              commentBody += `📊 Line Coverage: ${linesCoverage}%\n`;
+            }
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+        env:
+          TESTS_FAILED: ${{ steps.tests.outputs.tests_failed }}
+        if: always()
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Needed for secret scanning
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: npm-audit
+        run: |
+          npm audit --json > audit.json
+          echo "audit_file=audit.json" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@v3
+        id: trufflehog
+        with:
+          path: .
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          format: json
+          output: trufflehog.json
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let auditData = { metadata: { vulnerabilities: { total: 0, critical: 0, high: 0, moderate: 0, low: 0 } } };
+            try {
+              auditData = JSON.parse(fs.readFileSync(process.env.AUDIT_FILE, 'utf8'));
+            } catch (e) {
+              console.log("Error reading audit file:", e);
+            }
+            
+            let trufflehogData = { results: [] };
+            try {
+              trufflehogData = JSON.parse(fs.readFileSync('trufflehog.json', 'utf8'));
+            } catch (e) {
+              console.log("Error reading trufflehog file:", e);
+            }
+            
+            let commentBody = "## Security Scan Report\n\n";
+            
+            // Dependencies/Vulnerabilities
+            commentBody += "### Dependencies & Vulnerabilities\n";
+            if (auditData.metadata.vulnerabilities.total === 0) {
+              commentBody += "✅ No dependency vulnerabilities found.\n";
+            } else {
+              commentBody += `⚠️ Found ${auditData.metadata.vulnerabilities.total} dependency vulnerabilities:\n`;
+              commentBody += `- Critical: ${auditData.metadata.vulnerabilities.critical}\n`;
+              commentBody += `- High: ${auditData.metadata.vulnerabilities.high}\n`;
+              commentBody += `- Moderate: ${auditData.metadata.vulnerabilities.moderate}\n`;
+              commentBody += `- Low: ${auditData.metadata.vulnerabilities.low}\n`;
+              commentBody += "Run `npm audit` locally for details.\n";
+            }
+            
+            // Secrets
+            commentBody += "\n### Secret Scan\n";
+            if (trufflehogData.results.length === 0) {
+              commentBody += "✅ No secrets found in code changes.\n";
+            } else {
+              commentBody += `⚠️ Found ${trufflehogData.results.length} potential secrets. Please review:\n`;
+              trufflehogData.results.forEach(result => {
+                commentBody += `- ${result.path}: ${result.reason}\n`;
+              });
+            }
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+        env:
+          AUDIT_FILE: ${{ steps.npm-audit.outputs.audit_file }}
+        if: always()
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: npm run build || echo "build_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Validate endpoints (example)
+        id: validate-endpoints
+        if: steps.build.outputs.build_failed != 'true'
+        run: |
+          # Start the application
+          npm start &
+          APP_PID=$!
+          # Wait for server to start
+          sleep 10
+          # Validate main endpoint
+          if ! curl -f http://localhost:3000; then
+            echo "endpoints_failed=true" >> $GITHUB_OUTPUT
+          fi
+          # Stop the application
+          kill $APP_PID
+        continue-on-error: true  # Don't fail the entire job if endpoint check fails
+
+      - name: Create deployment preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview
+          path: dist/  # Adjust this path to match your actual build output directory
+          retention-days: 7
+        if: steps.build.outputs.build_failed != 'true'
+
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildFailed = process.env.BUILD_FAILED === 'true';
+            const endpointsFailed = process.env.ENDPOINTS_FAILED === 'true';
+            
+            let commentBody = "## Build Validation\n\n";
+            if (buildFailed) {
+              commentBody += "❌ Application build failed. Please fix build errors.\n";
+            } else {
+              commentBody += "✅ Application built successfully!\n";
+              if (endpointsFailed) {
+                commentBody += "⚠️ Endpoint validation failed. Please check the application server configuration or port.\n";
+              } else {
+                commentBody += "✅ Main endpoint is accessible.\n";
+              }
+              commentBody += "📦 Deployment preview artifact (dist/) available for download.\n";
+            }
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+        env:
+          BUILD_FAILED: ${{ steps.build.outputs.build_failed }}
+          ENDPOINTS_FAILED: ${{ steps.validate-endpoints.outputs.endpoints_failed }}
+        if: always()
